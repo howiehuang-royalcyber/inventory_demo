@@ -7,8 +7,10 @@ Set ANTHROPIC_API_KEY in env to enable the real LLM interpreter and NL layer.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -59,6 +61,105 @@ def _load_abom() -> pd.DataFrame:
 
 def _load_inventory() -> pd.DataFrame:
     return pd.read_csv(DATA / "inventory.csv")
+
+
+def _build_plan_workbook(plan, cm, inventory: dict, scenario_label: str = "Baseline") -> bytes:
+    """Render a build-plan result to a multi-sheet xlsx workbook (bytes)."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        # 1. Summary
+        summary = pd.DataFrame([
+            {"Metric": "Scenario", "Value": scenario_label},
+            {"Metric": "Vehicle", "Value": cm.vehicle_id if cm else ""},
+            {"Metric": "ABOM version", "Value": cm.abom_version if cm else ""},
+            {"Metric": "Exported at", "Value": datetime.now().isoformat(timespec="seconds")},
+            {"Metric": "Total buildable vehicles", "Value": plan.total_vehicles},
+            {"Metric": "Distinct configurations used", "Value": len(plan.plan)},
+            {"Metric": "Binding parts", "Value": len(plan.binding_constraints)},
+            {"Metric": "Interpreter mode", "Value": (cm.interpreter_meta.get("pass2", "") if cm else "")},
+        ])
+        summary.to_excel(xw, sheet_name="Summary", index=False)
+
+        # 2. Build plan
+        if plan.plan:
+            plan_df = pd.DataFrame([
+                {"config_id": p.config_id, "build_qty": p.quantity, **p.choices}
+                for p in plan.plan
+            ])
+        else:
+            plan_df = pd.DataFrame(columns=["config_id", "build_qty"])
+        plan_df.to_excel(xw, sheet_name="Build Plan", index=False)
+
+        # 3. Parts consumed (with on-hand and remaining)
+        rows = []
+        for part, used in sorted(plan.parts_consumed.items(), key=lambda x: -x[1]):
+            on_hand = inventory.get(part, 0)
+            rows.append({
+                "part_number": part,
+                "consumed": used,
+                "on_hand": on_hand,
+                "remaining": max(0, on_hand - used),
+                "is_binding": used == on_hand and on_hand > 0,
+            })
+        pd.DataFrame(rows).to_excel(xw, sheet_name="Parts Consumed", index=False)
+
+        # 4. Binding constraints
+        if plan.binding_constraints:
+            bnd = pd.DataFrame([b.model_dump() for b in plan.binding_constraints])
+        else:
+            bnd = pd.DataFrame(columns=["part_number", "on_hand", "consumed", "slack"])
+        bnd.to_excel(xw, sheet_name="Binding Constraints", index=False)
+
+        # 5. Unlock analysis
+        if plan.unlock_suggestions:
+            unl = pd.DataFrame([
+                {
+                    "part_number": u.part_number,
+                    "buy_qty": u.additional_qty_needed,
+                    "extra_vehicles_unlocked": u.additional_vehicles_unlocked,
+                    "estimated_cost_usd": u.estimated_cost,
+                    "vehicles_per_dollar": u.vehicles_per_dollar,
+                }
+                for u in plan.unlock_suggestions
+            ])
+        else:
+            unl = pd.DataFrame(columns=["part_number", "buy_qty", "extra_vehicles_unlocked", "estimated_cost_usd", "vehicles_per_dollar"])
+        unl.to_excel(xw, sheet_name="Unlock Analysis", index=False)
+
+        # 6. Configuration Model (option groups + constraints)
+        if cm:
+            og_rows = [
+                {
+                    "group_id": g.group_id, "find_num": g.find_num,
+                    "select": g.select, "qty_per_vehicle": g.qty_per_vehicle,
+                    "choices": ", ".join(g.choices), "confidence": g.confidence,
+                    "sme_status": g.sme_status,
+                }
+                for g in cm.option_groups
+            ]
+            pd.DataFrame(og_rows).to_excel(xw, sheet_name="Option Groups", index=False)
+
+            con_rows = []
+            for c in cm.constraints:
+                rhs = (c.then.choice if c.type == "implies" and c.then else
+                       (c.excluded.choice if c.excluded else ""))
+                rhs_group = (c.then.group if c.type == "implies" and c.then else
+                             (c.excluded.group if c.excluded else ""))
+                con_rows.append({
+                    "type": c.type,
+                    "if_group": c.if_.group, "if_choice": c.if_.choice,
+                    "rhs_group": rhs_group, "rhs_choice": rhs,
+                    "source_phrase": c.provenance.source_text,
+                    "source_rows": str(c.provenance.abom_rows),
+                    "confidence": c.confidence, "sme_status": c.sme_status,
+                })
+            pd.DataFrame(con_rows).to_excel(xw, sheet_name="Constraints", index=False)
+
+    return buf.getvalue()
+
+
+def _xlsx_filename(prefix: str = "crew_cru_build_plan") -> str:
+    return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
 
 # ---------- sidebar ----------
@@ -304,7 +405,20 @@ elif page.startswith("5"):
 
     if "plan" in st.session_state:
         plan = st.session_state["plan"]
-        st.metric("Total buildable Crew CRU vehicles", plan.total_vehicles)
+        cm = st.session_state.get("cm_approved") or st.session_state.get("cm")
+
+        top = st.columns([2, 1])
+        with top[0]:
+            st.metric("Total buildable Crew CRU vehicles", plan.total_vehicles)
+        with top[1]:
+            xlsx_bytes = _build_plan_workbook(plan, cm, st.session_state.get("inventory", {}), scenario_label="Baseline")
+            st.download_button(
+                label="⬇️ Export build plan to Excel",
+                data=xlsx_bytes,
+                file_name=_xlsx_filename(),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
         c1, c2 = st.columns(2)
         with c1:
@@ -399,6 +513,17 @@ elif page.startswith("6"):
                     for p in result.plan
                 ])
                 st.dataframe(df, use_container_width=True, height=320)
+
+                scenario_label = f"What-if: {intent.kind} — {q}"
+                xlsx_bytes = _build_plan_workbook(
+                    result, cm, st.session_state.get("inventory", {}), scenario_label=scenario_label,
+                )
+                st.download_button(
+                    label="⬇️ Export scenario plan to Excel",
+                    data=xlsx_bytes,
+                    file_name=_xlsx_filename(prefix="crew_cru_whatif"),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
             if result.binding_constraints:
                 st.subheader("Scenario binding constraints")
