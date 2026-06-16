@@ -14,6 +14,23 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+# Load .env for local development. On Streamlit Cloud, secrets are injected as
+# env vars automatically, so this is a no-op there.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# On Streamlit Cloud, secrets live in st.secrets. Promote them to env vars so
+# the rest of the code (which reads os.environ) works uniformly.
+try:
+    for _k in ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"):
+        if _k in st.secrets and not os.environ.get(_k):
+            os.environ[_k] = st.secrets[_k]
+except (FileNotFoundError, KeyError):
+    pass
+
 from src.enumerator import enumerate_valid_configurations
 from src.interpreter import interpret_abom
 from src.models import ConfigurationModel
