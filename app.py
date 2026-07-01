@@ -280,23 +280,49 @@ elif page.startswith("2"):
 
             with c2:
                 st.subheader(f"Constraints ({len(cm.constraints)})")
+                st.caption(
+                    "⚠️ marks constraints Claude parsed but couldn't fully "
+                    "ground — a market qualifier (e.g. 'Unless sold in Canada') "
+                    "or a many-to-many pairing (mirror ↔ body color). Stage 3 "
+                    "is where the SME resolves these."
+                )
+
+                def _render_ref(ref) -> str:
+                    """Render a ChoiceRef; empty/placeholder → (SME to specify)."""
+                    if ref is None:
+                        return "(SME to specify)"
+                    ch = (ref.choice or "").strip()
+                    if not ch or ch.startswith("<") or ch.upper() == "UNKNOWN":
+                        return "(SME to specify)"
+                    return ch
+
                 con_rows = []
                 for c in cm.constraints:
-                    if c.type == "implies" and c.then:
-                        rule = f"{c.if_.choice} → {c.then.choice}"
-                    elif c.type in ("excludes", "forbidden_with") and c.excluded:
-                        rule = f"{c.if_.choice} ⊗ {c.excluded.choice}"
+                    if c.type == "implies":
+                        rule = f"{_render_ref(c.if_)} → {_render_ref(c.then)}"
+                    elif c.type in ("excludes", "forbidden_with"):
+                        rule = f"{_render_ref(c.if_)} ⊗ {_render_ref(c.excluded)}"
                     elif c.type == "requires_one_of":
-                        rule = f"{c.if_.choice} requires one of …"
+                        rule = f"{_render_ref(c.if_)} requires one of …"
                     else:
                         rule = c.type
+                    needs_sme = ("(SME to specify)" in rule) or (c.confidence < 0.5)
                     con_rows.append({
-                        "type": c.type, "rule": rule,
+                        "needs_sme": "⚠️" if needs_sme else "",
+                        "type": c.type,
+                        "rule": rule,
                         "source_phrase": (c.provenance.source_text or "")[:80],
                         "excel_row": c.provenance.abom_rows,
-                        "confidence": c.confidence,
+                        "confidence": round(c.confidence, 2),
                     })
-                st.dataframe(pd.DataFrame(con_rows), width='stretch', height=420)
+                con_df = pd.DataFrame(con_rows)
+                if not con_df.empty:
+                    # Sort so needs-SME rows surface first, then by confidence ascending
+                    con_df = con_df.sort_values(
+                        by=["needs_sme", "confidence"],
+                        ascending=[False, True],
+                    ).reset_index(drop=True)
+                st.dataframe(con_df, width='stretch', height=420)
 
                 st.subheader("Interpreter meta")
                 st.json(cm.interpreter_meta)
@@ -346,18 +372,42 @@ elif page.startswith("3"):
                 g.sme_status = "pending"
 
     st.subheader("Constraints")
+    st.caption(
+        "Constraints flagged with ⚠️ need SME attention — Claude parsed the "
+        "phrase but couldn't fully resolve the target part (market qualifiers, "
+        "many-to-many pairings). They surface at the top."
+    )
     if not cm.constraints:
         st.info("No constraints extracted.")
-    for i, c in enumerate(cm.constraints):
-        if c.type == "implies" and c.then:
-            rule = f"if **{c.if_.choice}** then **{c.then.choice}**"
-        elif c.type in ("excludes", "forbidden_with") and c.excluded:
-            rule = f"**{c.if_.choice}** ⊗ **{c.excluded.choice}**"
+
+    def _ref(ref) -> str:
+        if ref is None:
+            return "(SME to specify)"
+        ch = (ref.choice or "").strip()
+        if not ch or ch.startswith("<") or ch.upper() == "UNKNOWN":
+            return "(SME to specify)"
+        return ch
+
+    # Order: needs-SME first, then confidence ascending, preserve original index
+    def _needs_sme(c) -> bool:
+        r = _ref(c.if_) + " " + _ref(c.then) + " " + _ref(c.excluded)
+        return "(SME to specify)" in r or c.confidence < 0.5
+
+    ordered = sorted(
+        enumerate(cm.constraints),
+        key=lambda t: (0 if _needs_sme(t[1]) else 1, t[1].confidence),
+    )
+
+    for i, c in ordered:
+        if c.type == "implies":
+            rule = f"if **{_ref(c.if_)}** then **{_ref(c.then)}**"
+        elif c.type in ("excludes", "forbidden_with"):
+            rule = f"**{_ref(c.if_)}** ⊗ **{_ref(c.excluded)}**"
         elif c.type == "requires_one_of":
-            rule = f"**{c.if_.choice}** requires one of (SME to specify)"
+            rule = f"**{_ref(c.if_)}** requires one of (SME to specify)"
         else:
             rule = c.type
-        flag = "⚠️ low conf" if c.confidence < 0.5 else ""
+        flag = "⚠️ needs SME" if _needs_sme(c) else ""
         with st.expander(f"{c.type} · conf {c.confidence:.2f} {flag} · row {c.provenance.abom_rows} · {c.sme_status}"):
             st.markdown(rule)
             if c.provenance.source_text:
